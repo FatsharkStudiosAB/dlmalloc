@@ -544,7 +544,9 @@ MAX_RELEASE_CHECK_RATE   default: 4095 unless not HAVE_MMAP
 #include <windows.h>
 #include <tchar.h>
 #define HAVE_MMAP 1
+#ifndef HAVE_MORECORE
 #define HAVE_MORECORE 0
+#endif
 #define LACKS_UNISTD_H
 #define LACKS_SYS_PARAM_H
 #define LACKS_SYS_MMAN_H
@@ -1280,7 +1282,7 @@ typedef void* mspace;
   compiling with a different DEFAULT_GRANULARITY or dynamically
   setting with mallopt(M_GRANULARITY, value).
 */
-DLMALLOC_EXPORT mspace create_mspace(size_t capacity, int locked);
+DLMALLOC_EXPORT mspace create_mspace(size_t capacity, int locked, void* user_data);
 
 /*
   destroy_mspace destroys the given space, and attempts to return all
@@ -1299,7 +1301,7 @@ DLMALLOC_EXPORT size_t destroy_mspace(mspace msp);
   Destroying this space will deallocate all additionally allocated
   space (if possible) but not the initial base.
 */
-DLMALLOC_EXPORT mspace create_mspace_with_base(void* base, size_t capacity, int locked);
+DLMALLOC_EXPORT mspace create_mspace_with_base(void* base, size_t capacity, int locked, void* user_data);
 
 /*
   mspace_track_large_chunks controls whether requests for large chunks
@@ -1674,7 +1676,7 @@ static FORCEINLINE void* win32direct_mmap(size_t size) {
   return (ptr != 0)? ptr: MFAIL;
 }
 
-/* This function supports releasing coalesed segments */
+/* This function supports releasing coalesced segments */
 static FORCEINLINE int win32munmap(void* ptr, size_t size) {
   MEMORY_BASIC_INFORMATION minfo;
   char* cptr = (char*)ptr;
@@ -1709,34 +1711,34 @@ static FORCEINLINE int win32munmap(void* ptr, size_t size) {
  */
 #if HAVE_MORECORE
     #ifdef MORECORE
-        #define CALL_MORECORE(S)    MORECORE(S)
+        #define CALL_MORECORE(S, U)    MORECORE(S, U)
     #else  /* MORECORE */
-        #define CALL_MORECORE(S)    MORECORE_DEFAULT(S)
+        #define CALL_MORECORE(S, U)    MORECORE_DEFAULT(S)
     #endif /* MORECORE */
 #else  /* HAVE_MORECORE */
-    #define CALL_MORECORE(S)        MFAIL
+    #define CALL_MORECORE(S, U)        MFAIL
 #endif /* HAVE_MORECORE */
 
 /**
  * Define CALL_MMAP/CALL_MUNMAP/CALL_DIRECT_MMAP
  */
 #if HAVE_MMAP
-    #define USE_MMAP_BIT            (SIZE_T_ONE)
+    #define USE_MMAP_BIT               (SIZE_T_ONE)
 
-    #ifdef MMAP
-        #define CALL_MMAP(s)        MMAP(s)
+	#ifdef MMAP
+        #define CALL_MMAP(s, u)        MMAP(s, u)
     #else /* MMAP */
-        #define CALL_MMAP(s)        MMAP_DEFAULT(s)
+        #define CALL_MMAP(s, u)        MMAP_DEFAULT(s)
     #endif /* MMAP */
     #ifdef MUNMAP
-        #define CALL_MUNMAP(a, s)   MUNMAP((a), (s))
+        #define CALL_MUNMAP(a, s, u)   MUNMAP((a), (s), u)
     #else /* MUNMAP */
-        #define CALL_MUNMAP(a, s)   MUNMAP_DEFAULT((a), (s))
+        #define CALL_MUNMAP(a, s, u)   MUNMAP_DEFAULT((a), (s), u)
     #endif /* MUNMAP */
     #ifdef DIRECT_MMAP
-        #define CALL_DIRECT_MMAP(s) DIRECT_MMAP(s)
+        #define CALL_DIRECT_MMAP(s, u) DIRECT_MMAP(s, u)
     #else /* DIRECT_MMAP */
-        #define CALL_DIRECT_MMAP(s) DIRECT_MMAP_DEFAULT(s)
+        #define CALL_DIRECT_MMAP(s, u) DIRECT_MMAP_DEFAULT(s)
     #endif /* DIRECT_MMAP */
 #else  /* HAVE_MMAP */
     #define USE_MMAP_BIT            (SIZE_T_ZERO)
@@ -1744,8 +1746,8 @@ static FORCEINLINE int win32munmap(void* ptr, size_t size) {
     #define MMAP(s)                 MFAIL
     #define MUNMAP(a, s)            (-1)
     #define DIRECT_MMAP(s)          MFAIL
-    #define CALL_DIRECT_MMAP(s)     DIRECT_MMAP(s)
-    #define CALL_MMAP(s)            MMAP(s)
+    #define CALL_DIRECT_MMAP(s, u)  DIRECT_MMAP(s)
+    #define CALL_MMAP(s, u)         MMAP(s)
     #define CALL_MUNMAP(a, s)       MUNMAP((a), (s))
 #endif /* HAVE_MMAP */
 
@@ -3138,7 +3140,9 @@ static int init_mparams(void) {
     mparams.page_size = psize;
     mparams.mmap_threshold = DEFAULT_MMAP_THRESHOLD;
     mparams.trim_threshold = DEFAULT_TRIM_THRESHOLD;
-#if MORECORE_CONTIGUOUS
+#if MSPACES_CONTIGUOUS
+	mparams.default_mflags = USE_LOCK_BIT;
+#elif MORECORE_CONTIGUOUS
     mparams.default_mflags = USE_LOCK_BIT|USE_MMAP_BIT;
 #else  /* MORECORE_CONTIGUOUS */
     mparams.default_mflags = USE_LOCK_BIT|USE_MMAP_BIT|USE_NONCONTIGUOUS_BIT;
@@ -3826,7 +3830,7 @@ static void* mmap_alloc(mstate m, size_t nb) {
       return 0;
   }
   if (mmsize > nb) {     /* Check for wrap around 0 */
-    char* mm = (char*)(CALL_DIRECT_MMAP(mmsize));
+    char* mm = (char*)(CALL_DIRECT_MMAP(mmsize, m->extp));
     if (mm != CMFAIL) {
       size_t offset = align_offset(chunk2mem(mm));
       size_t psize = mmsize - offset - MMAP_FOOT_PAD;
@@ -4082,7 +4086,7 @@ static void* sys_alloc(mstate m, size_t nb) {
     ACQUIRE_MALLOC_GLOBAL_LOCK();
 
     if (ss == 0) {  /* First time through or recovery */
-      char* base = (char*)CALL_MORECORE(0);
+      char* base = (char*)CALL_MORECORE(0, m->extp);
       if (base != CMFAIL) {
         size_t fp;
         /* Adjust to end on a page boundary */
@@ -4092,7 +4096,7 @@ static void* sys_alloc(mstate m, size_t nb) {
         if (ssize > nb && ssize < HALF_MAX_SIZE_T &&
             (m->footprint_limit == 0 ||
              (fp > m->footprint && fp <= m->footprint_limit)) &&
-            (br = (char*)(CALL_MORECORE(ssize))) == base) {
+            (br = (char*)(CALL_MORECORE(ssize, m->extp))) == base) {
           tbase = base;
           tsize = ssize;
         }
@@ -4103,7 +4107,7 @@ static void* sys_alloc(mstate m, size_t nb) {
       ssize = granularity_align(nb - m->topsize + SYS_ALLOC_PADDING);
       /* Use mem here only if it did continuously extend old space */
       if (ssize < HALF_MAX_SIZE_T &&
-          (br = (char*)(CALL_MORECORE(ssize))) == ss->base+ss->size) {
+          (br = (char*)(CALL_MORECORE(ssize, m->extp))) == ss->base+ss->size) {
         tbase = br;
         tsize = ssize;
       }
@@ -4115,11 +4119,11 @@ static void* sys_alloc(mstate m, size_t nb) {
             ssize < nb + SYS_ALLOC_PADDING) {
           size_t esize = granularity_align(nb + SYS_ALLOC_PADDING - ssize);
           if (esize < HALF_MAX_SIZE_T) {
-            char* end = (char*)CALL_MORECORE(esize);
+            char* end = (char*)CALL_MORECORE(esize, m->extp);
             if (end != CMFAIL)
               ssize += esize;
             else {            /* Can't use; try to release */
-              (void) CALL_MORECORE(-ssize);
+              (void) CALL_MORECORE(-ssize, m->extp);
               br = CMFAIL;
             }
           }
@@ -4137,7 +4141,7 @@ static void* sys_alloc(mstate m, size_t nb) {
   }
 
   if (HAVE_MMAP && tbase == CMFAIL) {  /* Try MMAP */
-    char* mp = (char*)(CALL_MMAP(asize));
+    char* mp = (char*)(CALL_MMAP(asize, m->extp));
     if (mp != CMFAIL) {
       tbase = mp;
       tsize = asize;
@@ -4150,8 +4154,8 @@ static void* sys_alloc(mstate m, size_t nb) {
       char* br = CMFAIL;
       char* end = CMFAIL;
       ACQUIRE_MALLOC_GLOBAL_LOCK();
-      br = (char*)(CALL_MORECORE(asize));
-      end = (char*)(CALL_MORECORE(0));
+      br = (char*)(CALL_MORECORE(asize, m->extp));
+      end = (char*)(CALL_MORECORE(0, m->extp));
       RELEASE_MALLOC_GLOBAL_LOCK();
       if (br != CMFAIL && end != CMFAIL && br < end) {
         size_t ssize = end - br;
@@ -4264,7 +4268,7 @@ static size_t release_unused_segments(mstate m) {
         else {
           unlink_large_chunk(m, tp);
         }
-        if (CALL_MUNMAP(base, size) == 0) {
+        if (CALL_MUNMAP(base, size, m->extp) == 0) {
           released += size;
           m->footprint -= size;
           /* unlink obsoleted record */
@@ -4309,7 +4313,7 @@ static int sys_trim(mstate m, size_t pad) {
             (void)newsize; /* placate people compiling -Wunused-variable */
             /* Prefer mremap, fall back to munmap */
             if ((CALL_MREMAP(sp->base, sp->size, newsize, 0) != MFAIL) ||
-                (CALL_MUNMAP(sp->base + newsize, extra) == 0)) {
+                (CALL_MUNMAP(sp->base + newsize, extra, m->extp) == 0)) {
               released = extra;
             }
           }
@@ -4320,10 +4324,10 @@ static int sys_trim(mstate m, size_t pad) {
           ACQUIRE_MALLOC_GLOBAL_LOCK();
           {
             /* Make sure end of memory is where we last set it. */
-            char* old_br = (char*)(CALL_MORECORE(0));
+            char* old_br = (char*)(CALL_MORECORE(0, m->extp));
             if (old_br == sp->base + sp->size) {
-              char* rel_br = (char*)(CALL_MORECORE(-extra));
-              char* new_br = (char*)(CALL_MORECORE(0));
+              char* rel_br = (char*)(CALL_MORECORE(-extra, m->extp));
+              char* new_br = (char*)(CALL_MORECORE(0, m->extp));
               if (rel_br != CMFAIL && new_br < old_br)
                 released = old_br - new_br;
             }
@@ -4362,7 +4366,7 @@ static void dispose_chunk(mstate m, mchunkptr p, size_t psize) {
     size_t prevsize = p->prev_foot;
     if (is_mmapped(p)) {
       psize += prevsize + MMAP_FOOT_PAD;
-      if (CALL_MUNMAP((char*)p - prevsize, psize) == 0)
+      if (CALL_MUNMAP((char*)p - prevsize, psize, m->extp) == 0)
         m->footprint -= psize;
       return;
     }
@@ -4701,7 +4705,7 @@ void dlfree(void* mem) {
           size_t prevsize = p->prev_foot;
           if (is_mmapped(p)) {
             psize += prevsize + MMAP_FOOT_PAD;
-            if (CALL_MUNMAP((char*)p - prevsize, psize) == 0)
+            if (CALL_MUNMAP((char*)p - prevsize, psize, m->extp) == 0)
               fm->footprint -= psize;
             goto postaction;
           }
@@ -5391,7 +5395,7 @@ size_t dlmalloc_usable_size(void* mem) {
 
 #if MSPACES
 
-static mstate init_user_mstate(char* tbase, size_t tsize) {
+static mstate init_user_mstate(char* tbase, size_t tsize, void* user_data) {
   size_t msize = pad_request(sizeof(struct malloc_state));
   mchunkptr mn;
   mchunkptr msp = align_as_chunk(tbase);
@@ -5404,9 +5408,8 @@ static mstate init_user_mstate(char* tbase, size_t tsize) {
   m->magic = mparams.magic;
   m->release_checks = MAX_RELEASE_CHECK_RATE;
   m->mflags = mparams.default_mflags;
-  m->extp = 0;
+  m->extp = user_data;
   m->exts = 0;
-  disable_contiguous(m);
   init_bins(m);
   mn = next_chunk(mem2chunk(m));
   init_top(m, mn, (size_t)((tbase + tsize) - (char*)mn) - TOP_FOOT_SIZE);
@@ -5414,7 +5417,7 @@ static mstate init_user_mstate(char* tbase, size_t tsize) {
   return m;
 }
 
-mspace create_mspace(size_t capacity, int locked) {
+mspace create_mspace(size_t capacity, int locked, void* user_data) {
   mstate m = 0;
   size_t msize;
   ensure_initialization();
@@ -5423,24 +5426,32 @@ mspace create_mspace(size_t capacity, int locked) {
     size_t rs = ((capacity == 0)? mparams.granularity :
                  (capacity + TOP_FOOT_SIZE + msize));
     size_t tsize = granularity_align(rs);
-    char* tbase = (char*)(CALL_MMAP(tsize));
+#if MSPACES_CONTIGUOUS
+    char* tbase = (char*)CALL_MORECORE(tsize, user_data);
+#else
+	char* tbase = (char*)(CALL_MMAP(tsize, user_data));
+#endif
     if (tbase != CMFAIL) {
-      m = init_user_mstate(tbase, tsize);
+      m = init_user_mstate(tbase, tsize, user_data);
+#if !MSPACES_CONTIGUOUS
       m->seg.sflags = USE_MMAP_BIT;
+	  disable_contiguous(m);
+#endif
       set_lock(m, locked);
     }
   }
   return (mspace)m;
 }
 
-mspace create_mspace_with_base(void* base, size_t capacity, int locked) {
+mspace create_mspace_with_base(void* base, size_t capacity, int locked, void* user_data) {
   mstate m = 0;
   size_t msize;
   ensure_initialization();
   msize = pad_request(sizeof(struct malloc_state));
   if (capacity > msize + TOP_FOOT_SIZE &&
       capacity < (size_t) -(msize + TOP_FOOT_SIZE + mparams.page_size)) {
-    m = init_user_mstate((char*)base, capacity);
+    m = init_user_mstate((char*)base, capacity, user_data);
+	disable_contiguous(m);
     m->seg.sflags = EXTERN_BIT;
     set_lock(m, locked);
   }
@@ -5477,7 +5488,7 @@ size_t destroy_mspace(mspace msp) {
       (void)base; /* placate people compiling -Wunused-variable */
       sp = sp->next;
       if ((flag & USE_MMAP_BIT) && !(flag & EXTERN_BIT) &&
-          CALL_MUNMAP(base, size) == 0)
+          CALL_MUNMAP(base, size, ms->extp) == 0)
         freed += size;
     }
   }
@@ -5628,7 +5639,7 @@ void mspace_free(mspace msp, void* mem) {
           size_t prevsize = p->prev_foot;
           if (is_mmapped(p)) {
             psize += prevsize + MMAP_FOOT_PAD;
-            if (CALL_MUNMAP((char*)p - prevsize, psize) == 0)
+            if (CALL_MUNMAP((char*)p - prevsize, psize, fm->extp) == 0)
               fm->footprint -= psize;
             goto postaction;
           }
