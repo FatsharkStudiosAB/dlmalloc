@@ -259,6 +259,10 @@ MSPACES                  default: 0 (false)
 ONLY_MSPACES             default: 0 (false)
   If true, only compile in mspace versions, not regular versions.
 
+MSPACES_CONTIGUOUS       default: 0 (false)
+  If true, will call defined MORECORE routine to extend\shrink mspace's heap.
+  It receives userdata passed to create_mspace as a param
+
 USE_LOCKS                default: 0 (false)
   Causes each call to each public routine to be surrounded with
   pthread or WIN32 mutex lock/unlock. (If set true, this can be
@@ -619,6 +623,9 @@ MAX_RELEASE_CHECK_RATE   default: 4095 unless not HAVE_MMAP
 #define MSPACES 0
 #endif  /* ONLY_MSPACES */
 #endif  /* MSPACES */
+#ifndef MSPACES_CONTIGUOUS
+#	define MSPACES_CONTIGUOUS 0
+#endif
 #ifdef MSPACES_CONTIGUOUS
 #	ifndef MORECORE
 #		error "MSPACES_CONTIGUOUS requires custom defined MORECORE"
@@ -1288,9 +1295,11 @@ typedef void* mspace;
   dynamically as needed to service mspace_malloc requests.  You can
   control the sizes of incremental increases of this space by
   compiling with a different DEFAULT_GRANULARITY or dynamically
-  setting with mallopt(M_GRANULARITY, value).
+  setting with mallopt(M_GRANULARITY, value). If min_trim_footprint is
+  set to value different than 0, mspace will not be trimmed if
+  it's footprint is less than min_trim_footprint
 */
-DLMALLOC_EXPORT mspace create_mspace(size_t capacity, int locked, void* user_data);
+DLMALLOC_EXPORT mspace create_mspace(size_t capacity, int locked, void* user_data, size_t min_trim_footprint);
 
 /*
   destroy_mspace destroys the given space, and attempts to return all
@@ -1741,7 +1750,7 @@ static FORCEINLINE int win32munmap(void* ptr, size_t size) {
     #ifdef MUNMAP
         #define CALL_MUNMAP(a, s, u)   MUNMAP((a), (s), u)
     #else /* MUNMAP */
-        #define CALL_MUNMAP(a, s, u)   MUNMAP_DEFAULT((a), (s), u)
+        #define CALL_MUNMAP(a, s, u)   MUNMAP_DEFAULT((a), (s))
     #endif /* MUNMAP */
     #ifdef DIRECT_MMAP
         #define CALL_DIRECT_MMAP(s, u) DIRECT_MMAP(s, u)
@@ -2593,6 +2602,7 @@ struct malloc_state {
   mchunkptr  dv;
   mchunkptr  top;
   size_t     trim_check;
+  size_t     min_trim_footprint;
   size_t     release_checks;
   size_t     magic;
   mchunkptr  smallbins[(NSMALLBINS+1)*2];
@@ -2725,7 +2735,7 @@ static int has_segment_link(mstate m, msegmentptr ss) {
 }
 
 #ifndef MORECORE_CANNOT_TRIM
-#define should_trim(M,s)  ((s) > (M)->trim_check)
+#define should_trim(M,s)  (((s) > (M)->trim_check) && (((M)->footprint - (M)->min_trim_footprint) > mparams.granularity))
 #else  /* MORECORE_CANNOT_TRIM */
 #define should_trim(M,s)  (0)
 #endif /* MORECORE_CANNOT_TRIM */
@@ -4188,6 +4198,7 @@ static void* sys_alloc(mstate m, size_t nb) {
       m->seg.sflags = mmap_flag;
       m->magic = mparams.magic;
       m->release_checks = MAX_RELEASE_CHECK_RATE;
+	  m->min_trim_footprint = 0;
       init_bins(m);
 #if !ONLY_MSPACES
       if (is_global(m))
@@ -4311,6 +4322,10 @@ static int sys_trim(mstate m, size_t pad) {
       size_t extra = ((m->topsize - pad + (unit - SIZE_T_ONE)) / unit -
                       SIZE_T_ONE) * unit;
       msegmentptr sp = segment_holding(m, (char*)m->top);
+      if (m->footprint - extra < m->min_trim_footprint) {
+        extra = ((m->footprint - m->min_trim_footprint + (unit -
+                 SIZE_T_ONE)) / unit - SIZE_T_ONE) * unit;
+	  }
 
       if (!is_extern_segment(sp)) {
         if (is_mmapped_segment(sp)) {
@@ -5403,7 +5418,7 @@ size_t dlmalloc_usable_size(void* mem) {
 
 #if MSPACES
 
-static mstate init_user_mstate(char* tbase, size_t tsize, void* user_data) {
+static mstate init_user_mstate(char* tbase, size_t tsize, void* user_data, size_t min_trim_footprint) {
   size_t msize = pad_request(sizeof(struct malloc_state));
   mchunkptr mn;
   mchunkptr msp = align_as_chunk(tbase);
@@ -5421,11 +5436,12 @@ static mstate init_user_mstate(char* tbase, size_t tsize, void* user_data) {
   init_bins(m);
   mn = next_chunk(mem2chunk(m));
   init_top(m, mn, (size_t)((tbase + tsize) - (char*)mn) - TOP_FOOT_SIZE);
+  m->min_trim_footprint = min_trim_footprint;
   check_top_chunk(m, m->top);
   return m;
 }
 
-mspace create_mspace(size_t capacity, int locked, void* user_data) {
+mspace create_mspace(size_t capacity, int locked, void* user_data, size_t min_trim_footprint) {
   mstate m = 0;
   size_t msize;
   ensure_initialization();
@@ -5440,7 +5456,7 @@ mspace create_mspace(size_t capacity, int locked, void* user_data) {
 	char* tbase = (char*)(CALL_MMAP(tsize, user_data));
 #endif
     if (tbase != CMFAIL) {
-      m = init_user_mstate(tbase, tsize, user_data);
+      m = init_user_mstate(tbase, tsize, user_data, min_trim_footprint);
 #if !MSPACES_CONTIGUOUS
       m->seg.sflags = USE_MMAP_BIT;
 	  disable_contiguous(m);
@@ -5458,7 +5474,7 @@ mspace create_mspace_with_base(void* base, size_t capacity, int locked, void* us
   msize = pad_request(sizeof(struct malloc_state));
   if (capacity > msize + TOP_FOOT_SIZE &&
       capacity < (size_t) -(msize + TOP_FOOT_SIZE + mparams.page_size)) {
-    m = init_user_mstate((char*)base, capacity, user_data);
+    m = init_user_mstate((char*)base, capacity, user_data, 0);
 	disable_contiguous(m);
     m->seg.sflags = EXTERN_BIT;
     set_lock(m, locked);
