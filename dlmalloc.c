@@ -5450,17 +5450,23 @@ mspace create_mspace(size_t capacity, int locked, void* user_data, size_t min_tr
     size_t rs = ((capacity == 0)? mparams.granularity :
                  (capacity + TOP_FOOT_SIZE + msize));
     size_t tsize = granularity_align(rs);
+    int mmaped = 0;
 #if MSPACES_CONTIGUOUS
     char* tbase = (char*)CALL_MORECORE(tsize, user_data);
+    if (tbase == CMFAIL) {
+        tbase = (char*)(CALL_MMAP(tsize, user_data));
+        mmaped = 1;
+    }
 #else
-	char* tbase = (char*)(CALL_MMAP(tsize, user_data));
+    char* tbase = (char*)(CALL_MMAP(tsize, user_data));
+    mmaped = 1;
 #endif
     if (tbase != CMFAIL) {
-      m = init_user_mstate(tbase, tsize, user_data, min_trim_footprint);
-#if !MSPACES_CONTIGUOUS
-      m->seg.sflags = USE_MMAP_BIT;
-	  disable_contiguous(m);
-#endif
+        m = init_user_mstate(tbase, tsize, user_data, min_trim_footprint);
+        if (mmaped) {
+            m->seg.sflags = USE_MMAP_BIT;
+            disable_contiguous(m);
+        }
       set_lock(m, locked);
     }
   }
